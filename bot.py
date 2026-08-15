@@ -5,67 +5,112 @@ import random
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
-from aiohttp import web
 
 from content import FACTS, BEACH_TIPS
 from services import FontankaData, WeatherService
 from photos import wikimedia_photo
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 log = logging.getLogger("fontanka")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
-CHAT_ID_ENV = os.getenv("CHAT_ID", "")
+CHAT_ID_ENV = os.getenv("CHAT_ID", "").strip()
+
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Kyiv"))
+
+# Автоматические публикации: 09:00, 14:00, 19:00.
 MORNING_HOUR = int(os.getenv("MORNING_HOUR", "9"))
-AFTERNOON_HOUR = int(os.getenv("AFTERNOON_HOUR", "13"))
-EVENING_HOUR = int(os.getenv("EVENING_HOUR", "18"))
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "30"))
+AFTERNOON_HOUR = int(os.getenv("AFTERNOON_HOUR", "14"))
+EVENING_HOUR = int(os.getenv("EVENING_HOUR", "19"))
+
+# Это только частота проверки расписания/предупреждений.
+# Погода НЕ запрашивается каждые 30/60 секунд благодаря кэшу.
+SCHEDULER_INTERVAL = min(int(os.getenv("CHECK_INTERVAL_SECONDS", "30")), 60)
+
+WEATHER_CACHE_MIN = int(os.getenv("WEATHER_CACHE_MIN", "10"))
 ALERT_COOLDOWN_MIN = int(os.getenv("ALERT_COOLDOWN_MIN", "180"))
+
+# Воздушные тревоги подключаются только если эта переменная задана.
+# Токен не нужно вставлять в код.
+AIR_ALERT_CHECK_SECONDS = int(os.getenv("AIR_ALERT_CHECK_SECONDS", "60"))
+AIR_ALERTS_TOKEN = os.getenv("ALERTS_API_TOKEN", "").strip()
+
 PORT = int(os.getenv("PORT", "8080"))
 LAT = float(os.getenv("LATITUDE", "46.56"))
 LON = float(os.getenv("LONGITUDE", "30.86"))
 LOCATION_NAME = os.getenv("LOCATION_NAME", "Фонтанка")
 
 
-def parse_chat_id() -> int | None:
-    if CHAT_ID_ENV.strip():
-        try:
-            return int(CHAT_ID_ENV.strip())
-        except ValueError:
-            log.error("CHAT_ID must be an integer")
-    return None
-
-TARGET_CHAT_ID = parse_chat_id()
-LAST_ALERT_SIGNATURE = ""
-LAST_ALERT_AT: datetime | None = None
-
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher()
 weather = WeatherService(LAT, LON, TIMEZONE)
 
 
+TARGET_CHAT_ID: int | None = None
+if CHAT_ID_ENV:
+    try:
+        TARGET_CHAT_ID = int(CHAT_ID_ENV)
+    except ValueError:
+        log.error("CHAT_ID must be an integer")
+
+
+# Кэш погоды: защищает Open-Meteo от лишних запросов.
+LAST_WEATHER: FontankaData | None = None
+LAST_WEATHER_AT: datetime | None = None
+
+# Защита от повторных погодных предупреждений.
+LAST_WEATHER_ALERT_SIGNATURE = ""
+LAST_WEATHER_ALERT_AT: datetime | None = None
+
+# Последнее состояние воздушной тревоги.
+LAST_AIR_ALERT_STATE: str | None = None
+
+
 def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌤 Погода", callback_data="weather"), InlineKeyboardButton(text="🌊 Море", callback_data="sea")],
-        [InlineKeyboardButton(text="📅 7 дней", callback_data="forecast"), InlineKeyboardButton(text="🏖 Пляж", callback_data="beach")],
-        [InlineKeyboardButton(text="💡 Факт дня", callback_data="fact"), InlineKeyboardButton(text="🎯 Совет", callback_data="tip")],
-        [InlineKeyboardButton(text="⚠️ Предупреждения", callback_data="alerts"), InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh")],
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🌤 Погода", callback_data="weather"),
+                InlineKeyboardButton(text="🌊 Море", callback_data="sea"),
+            ],
+            [
+                InlineKeyboardButton(text="📅 7 дней", callback_data="forecast"),
+                InlineKeyboardButton(text="🏖 Пляж", callback_data="beach"),
+            ],
+            [
+                InlineKeyboardButton(text="💡 Факт дня", callback_data="fact"),
+                InlineKeyboardButton(text="🎯 Совет", callback_data="tip"),
+            ],
+            [
+                InlineKeyboardButton(text="🚨 Тревога", callback_data="air_alert"),
+                InlineKeyboardButton(text="⚠️ Погода", callback_data="alerts"),
+            ],
+            [
+                InlineKeyboardButton(text="📸 Фото", callback_data="photo"),
+                InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh"),
+            ],
+        ]
+    )
 
 
 def is_admin(user_id: int | None) -> bool:
     return bool(ADMIN_USER_ID and user_id == ADMIN_USER_ID)
-
-
-def target_chat(message: Message) -> int:
-    return TARGET_CHAT_ID or message.chat.id
 
 
 def direction(deg: float | None) -> str:
@@ -75,13 +120,23 @@ def direction(deg: float | None) -> str:
     return dirs[int((deg + 22.5) // 45) % 8]
 
 
+def safe_number(value, digits=1, suffix=""):
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.{digits}f}{suffix}"
+    except (TypeError, ValueError):
+        return "—"
+
+
 def weather_text(data: FontankaData) -> str:
     return (
         f"🌤 <b>{LOCATION_NAME} — погода</b>\n\n"
-        f"🌡 Воздух: <b>{data.air_temp:+.1f}°C</b>\n"
-        f"🥵 Ощущается: <b>{data.feels_like:+.1f}°C</b>\n"
-        f"💨 Ветер: <b>{data.wind_speed:.1f} м/с</b> {direction(data.wind_dir)}\n"
-        f"💨 Порывы: <b>{data.wind_gusts:.1f} м/с</b>\n"
+        f"🌡 Воздух: <b>{safe_number(data.air_temp, 1, '°C')}</b>\n"
+        f"🥵 Ощущается: <b>{safe_number(data.feels_like, 1, '°C')}</b>\n"
+        f"💨 Ветер: <b>{safe_number(data.wind_speed, 1, ' м/с')}</b> "
+        f"{direction(data.wind_dir)}\n"
+        f"💨 Порывы: <b>{safe_number(data.wind_gusts, 1, ' м/с')}</b>\n"
         f"💧 Влажность: <b>{data.humidity}%</b>\n"
         f"☔ Осадки: <b>{data.precip_prob}%</b>\n"
         f"{data.weather_emoji} {data.weather_desc}\n\n"
@@ -91,14 +146,12 @@ def weather_text(data: FontankaData) -> str:
 
 
 def sea_text(data: FontankaData) -> str:
-    wave = f"{data.wave_height:.2f} м" if data.wave_height is not None else "—"
-    water = f"{data.water_temp:.1f}°C" if data.water_temp is not None else "—"
     return (
         f"🌊 <b>{LOCATION_NAME} — море</b>\n\n"
-        f"💧 Температура воды: <b>{water}</b>\n"
-        f"🌊 Высота волн: <b>{wave}</b>\n"
+        f"💧 Температура воды: <b>{safe_number(data.water_temp, 1, '°C')}</b>\n"
+        f"🌊 Высота волн: <b>{safe_number(data.wave_height, 2, ' м')}</b>\n"
         f"🌀 Направление волн: <b>{direction(data.wave_dir)}</b>\n"
-        f"🌬 Ветер: <b>{data.wind_speed:.1f} м/с</b>\n\n"
+        f"🌬 Ветер: <b>{safe_number(data.wind_speed, 1, ' м/с')}</b>\n\n"
         f"{data.sea_rating}"
     )
 
@@ -107,146 +160,518 @@ def forecast_text(data: FontankaData) -> str:
     lines = [f"📅 <b>{LOCATION_NAME} — прогноз на 7 дней</b>", ""]
     for d in data.daily:
         lines.append(
-            f"<b>{d['date']}</b> {d['emoji']}  <b>{d['tmax']:+.0f}° / {d['tmin']:+.0f}°</b>  "
+            f"<b>{d['date']}</b> {d['emoji']}  "
+            f"<b>{d['tmax']:+.0f}° / {d['tmin']:+.0f}°</b>  "
             f"☔ {d['rain']:.0f}%  💨 {d['wind']:.0f} м/с"
         )
     return "\n".join(lines)
 
 
 def alerts_text(data: FontankaData) -> str:
-    alerts = data.alerts
-    if not alerts:
-        return "✅ <b>Серьёзных погодных предупреждений сейчас нет.</b>\n\nОбычный режим отдыха."
-    return "⚠️ <b>Предупреждения</b>\n\n" + "\n\n".join(f"• {a}" for a in alerts)
+    if not data.alerts:
+        return (
+            "✅ <b>Серьёзных погодных предупреждений сейчас нет.</b>\n\n"
+            "Обычный режим отдыха."
+        )
+
+    return (
+        "⚠️ <b>Погодные предупреждения</b>\n\n"
+        + "\n\n".join(f"• {a}" for a in data.alerts)
+    )
 
 
-async def send_main(chat_id: int, text: str) -> None:
-    await bot.send_message(chat_id, text, reply_markup=main_keyboard())
+async def get_current(force: bool = False) -> FontankaData:
+    """
+    Получает текущую погоду.
+    Повторные запросы в течение WEATHER_CACHE_MIN минут берутся из кэша.
+    Если API временно недоступен, используется последняя успешная копия.
+    """
+    global LAST_WEATHER, LAST_WEATHER_AT
+
+    now = datetime.now(TIMEZONE)
+
+    if (
+        not force
+        and LAST_WEATHER is not None
+        and LAST_WEATHER_AT is not None
+        and now - LAST_WEATHER_AT < timedelta(minutes=WEATHER_CACHE_MIN)
+    ):
+        return LAST_WEATHER
+
+    try:
+        data = await weather.current()
+        LAST_WEATHER = data
+        LAST_WEATHER_AT = now
+        return data
+    except Exception:
+        if LAST_WEATHER is not None:
+            log.exception("Weather refresh failed; using cached data")
+            return LAST_WEATHER
+        raise
 
 
 async def send_morning(chat_id: int) -> None:
-    data = await weather.current()
+    data = await get_current(force=True)
+
     text = (
-        f"☀️ <b>Доброе утро, Фонтанка!</b>\n\n"
-        + weather_text(data)
-        + "\n\n🏖 <b>Пляжный совет:</b> " + random.choice(BEACH_TIPS)
+        "☀️ <b>ДОБРОЕ УТРО, ФОНТАНКА!</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"{weather_text(data)}\n\n"
+        f"🌊 {data.sea_rating}\n\n"
+        f"🏖 <b>Совет:</b> {random.choice(BEACH_TIPS)}\n\n"
+        f"💡 <b>Факт:</b> {random.choice(FACTS)}"
     )
-    await send_main(chat_id, text)
+
+    await bot.send_message(chat_id, text, reply_markup=main_keyboard())
+
+
+async def send_afternoon(chat_id: int) -> None:
+    data = await get_current(force=True)
+
+    text = (
+        "☀️ <b>ФОНТАНКА — ДНЕВНОЕ ОБНОВЛЕНИЕ</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"🌡 Воздух: <b>{safe_number(data.air_temp, 1, '°C')}</b>\n"
+        f"🌊 Вода: <b>{safe_number(data.water_temp, 1, '°C')}</b>\n"
+        f"〰️ Волны: <b>{safe_number(data.wave_height, 2, ' м')}</b>\n"
+        f"💨 Ветер: <b>{safe_number(data.wind_speed, 1, ' м/с')}</b>\n"
+        f"☔ Осадки: <b>{data.precip_prob}%</b>\n\n"
+        f"🏖 <b>{data.beach_rating}</b>\n\n"
+        f"💡 {random.choice(BEACH_TIPS)}"
+    )
+
+    await bot.send_message(chat_id, text, reply_markup=main_keyboard())
 
 
 async def send_evening(chat_id: int) -> None:
-    data = await weather.current()
+    data = await get_current(force=True)
+
     text = (
-        f"🌅 <b>Вечерняя сводка — {LOCATION_NAME}</b>\n\n"
-        + weather_text(data)
-        + "\n\n🌊 " + data.sea_rating
+        "🌅 <b>ВЕЧЕРНЯЯ ФОНТАНКА</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"{weather_text(data)}\n\n"
+        f"🌊 {data.sea_rating}\n\n"
+        f"💡 <b>Факт:</b> {random.choice(FACTS)}\n"
+        f"🎯 <b>Совет:</b> {random.choice(BEACH_TIPS)}"
     )
-    await send_main(chat_id, text)
 
-
-async def send_fact(chat_id: int) -> None:
-    await bot.send_message(chat_id, f"💡 <b>Факт дня</b>\n\n{random.choice(FACTS)}", reply_markup=main_keyboard())
+    await bot.send_message(chat_id, text, reply_markup=main_keyboard())
 
 
 async def send_photo(chat_id: int) -> None:
-    photo = await wikimedia_photo()
-    if not photo:
+    try:
+        photo = await wikimedia_photo()
+
+        if not photo:
+            await bot.send_message(
+                chat_id,
+                "📸 <b>Фото дня</b>\n\nПока не удалось получить фотографию.",
+                reply_markup=main_keyboard(),
+            )
+            return
+
+        caption = f"📸 <b>Фото дня</b>\n{photo['title']}"
+
+        if photo.get("license"):
+            caption += f"\nЛицензия: {photo['license']}"
+
+        await bot.send_photo(
+            chat_id,
+            photo["url"],
+            caption=caption,
+            reply_markup=main_keyboard(),
+        )
+
+    except Exception:
+        log.exception("Photo of the day failed")
+
+
+async def fetch_air_alert_state() -> str:
+    """
+    alerts.in.ua:
+    A = тревога по всей области
+    P = частичная тревога
+    N = активной тревоги нет
+    """
+    if not AIR_ALERTS_TOKEN:
+        return "UNKNOWN"
+
+    url = (
+        "https://api.alerts.in.ua/"
+        "v1/iot/active_air_raid_alerts_by_oblast.json"
+    )
+    headers = {"Authorization": f"Bearer {AIR_ALERTS_TOKEN}"}
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.get(url, timeout=15) as response:
+            response.raise_for_status()
+            statuses = await response.text()
+
+    # Официальный порядок областей:
+    # Одеська область находится на позиции 16 (индекс 15).
+    return statuses[15] if len(statuses) > 15 else "N"
+
+
+async def air_alert_text() -> str:
+    if not AIR_ALERTS_TOKEN:
+        return (
+            "🚨 <b>ТРЕВОГА</b>\n\n"
+            "Источник воздушных тревог пока не подключён.\n\n"
+            "Для подключения добавим <code>ALERTS_API_TOKEN</code> "
+            "в Railway."
+        )
+
+    status = await fetch_air_alert_state()
+
+    if status == "A":
+        return (
+            "🚨 <b>ВОЗДУШНАЯ ТРЕВОГА</b>\n\n"
+            "В Одесской области сейчас объявлена воздушная тревога.\n\n"
+            "⚠️ Следите за официальными сообщениями и при необходимости "
+            "пройдите в укрытие."
+        )
+
+    if status == "P":
+        return (
+            "⚠️ <b>ЧАСТИЧНАЯ ТРЕВОГА</b>\n\n"
+            "В отдельных районах/общинах Одесской области есть активная тревога.\n\n"
+            "Следите за официальными сообщениями."
+        )
+
+    return "🟢 <b>Сейчас активной воздушной тревоги не обнаружено.</b>"
+
+
+async def weather_alert_loop() -> None:
+    """
+    Погодные предупреждения.
+    Погода берётся из кэша, поэтому здесь нет постоянного обращения
+    к Open-Meteo.
+    """
+    global LAST_WEATHER_ALERT_SIGNATURE, LAST_WEATHER_ALERT_AT
+
+    while True:
+        try:
+            if TARGET_CHAT_ID:
+                data = await get_current()
+
+                if data.alerts:
+                    now = datetime.now(TIMEZONE)
+                    signature = "|".join(data.alerts)
+
+                    cooldown_ok = (
+                        LAST_WEATHER_ALERT_AT is None
+                        or now - LAST_WEATHER_ALERT_AT
+                        >= timedelta(minutes=ALERT_COOLDOWN_MIN)
+                    )
+
+                    if (
+                        signature != LAST_WEATHER_ALERT_SIGNATURE
+                        or cooldown_ok
+                    ):
+                        await bot.send_message(
+                            TARGET_CHAT_ID,
+                            "🚨 <b>ВАЖНОЕ ПОГОДНОЕ ПРЕДУПРЕЖДЕНИЕ</b>\n\n"
+                            + "\n\n".join(
+                                f"• {alert}" for alert in data.alerts
+                            ),
+                            reply_markup=main_keyboard(),
+                        )
+
+                        LAST_WEATHER_ALERT_SIGNATURE = signature
+                        LAST_WEATHER_ALERT_AT = now
+
+        except Exception:
+            log.exception("Weather alert check failed")
+
+        await asyncio.sleep(SCHEDULER_INTERVAL)
+
+
+async def air_alert_loop() -> None:
+    """
+    Проверка воздушной тревоги раз в минуту.
+    Работает только если ALERTS_API_TOKEN задан.
+    """
+    global LAST_AIR_ALERT_STATE
+
+    if not AIR_ALERTS_TOKEN:
+        log.info(
+            "Air-alert API disabled: ALERTS_API_TOKEN is not set."
+        )
         return
-    caption = f"📸 <b>Фото дня</b>\n{photo['title']}"
-    if photo.get("license"):
-        caption += f"\nЛицензия: {photo['license']}"
-    await bot.send_photo(chat_id, photo["url"], caption=caption, reply_markup=main_keyboard())
+
+    while True:
+        try:
+            if TARGET_CHAT_ID:
+                status = await fetch_air_alert_state()
+
+                if status == "A":
+                    state = "ACTIVE"
+                elif status == "P":
+                    state = "PARTIAL"
+                else:
+                    state = "CLEAR"
+
+                if state != LAST_AIR_ALERT_STATE:
+                    if state == "ACTIVE":
+                        text = (
+                            "🚨 <b>ВОЗДУШНАЯ ТРЕВОГА</b>\n\n"
+                            "В Одесской области сейчас объявлена воздушная тревога.\n\n"
+                            "⚠️ Следите за официальными сообщениями и "
+                            "при необходимости пройдите в укрытие."
+                        )
+                    elif state == "PARTIAL":
+                        text = (
+                            "⚠️ <b>ЧАСТИЧНАЯ ТРЕВОГА</b>\n\n"
+                            "В отдельных районах/общинах Одесской области "
+                            "есть активная тревога.\n\n"
+                            "Следите за официальными сообщениями."
+                        )
+                    else:
+                        # Не отправляем «отбой» при самом первом запуске.
+                        text = (
+                            "🟢 <b>ОТБОЙ ТРЕВОГИ</b>\n\n"
+                            "Воздушная тревога завершена."
+                        )
+
+                    # Первый CLEAR после запуска не является «отбоем».
+                    if not (
+                        state == "CLEAR"
+                        and LAST_AIR_ALERT_STATE is None
+                    ):
+                        await bot.send_message(
+                            TARGET_CHAT_ID,
+                            text,
+                            reply_markup=main_keyboard(),
+                        )
+
+                    LAST_AIR_ALERT_STATE = state
+
+        except Exception:
+            log.exception("Air-alert check failed")
+
+        await asyncio.sleep(AIR_ALERT_CHECK_SECONDS)
 
 
-async def scheduler_loop() -> None:
-    global LAST_ALERT_SIGNATURE, LAST_ALERT_AT
-    sent_dates: set[tuple[str, str]] = set()
+async def automatic_posts_loop() -> None:
+    """
+    Автоматические публикации:
+      09:00 — утро
+      14:00 — дневное обновление
+      19:00 — вечер
+
+    Окно 10 минут позволяет пережить небольшой перезапуск Railway.
+    """
+    sent: set[tuple[str, str]] = set()
+
     while True:
         try:
             now = datetime.now(TIMEZONE)
-            chat_id = TARGET_CHAT_ID
-            if chat_id:
-                for name, hour in (("morning", MORNING_HOUR), ("afternoon", AFTERNOON_HOUR), ("evening", EVENING_HOUR)):
-                    key = (now.date().isoformat(), name)
-                    if now.hour == hour and now.minute < 2 and key not in sent_dates:
-                        if name == "morning":
-                            await send_morning(chat_id)
-                        elif name == "afternoon":
-                            await send_fact(chat_id)
-                            await send_photo(chat_id)
-                        else:
-                            await send_evening(chat_id)
-                        sent_dates.add(key)
 
-                data = await weather.current()
-                if data.alerts:
-                    signature = "|".join(data.alerts)
-                    cooldown_ok = LAST_ALERT_AT is None or (now - LAST_ALERT_AT) >= timedelta(minutes=ALERT_COOLDOWN_MIN)
-                    if signature != LAST_ALERT_SIGNATURE or cooldown_ok:
-                        await bot.send_message(chat_id, "🚨 <b>Важное погодное предупреждение</b>\n\n" + "\n\n".join(f"• {a}" for a in data.alerts), reply_markup=main_keyboard())
-                        LAST_ALERT_SIGNATURE = signature
-                        LAST_ALERT_AT = now
-                # prevent memory growth
-                sent_dates = {k for k in sent_dates if k[0] == now.date().isoformat()}
+            if TARGET_CHAT_ID:
+                schedules = (
+                    ("morning", MORNING_HOUR, send_morning),
+                    ("afternoon", AFTERNOON_HOUR, send_afternoon),
+                    ("evening", EVENING_HOUR, send_evening),
+                )
+
+                for name, hour, function in schedules:
+                    key = (now.date().isoformat(), name)
+
+                    if (
+                        now.hour == hour
+                        and now.minute < 10
+                        and key not in sent
+                    ):
+                        try:
+                            await function(TARGET_CHAT_ID)
+                            sent.add(key)
+                            log.info(
+                                "Automatic %s post sent at %s",
+                                name,
+                                now.isoformat(),
+                            )
+                        except Exception:
+                            log.exception(
+                                "Automatic %s post failed",
+                                name,
+                            )
+
+                sent = {
+                    item
+                    for item in sent
+                    if item[0] == now.date().isoformat()
+                }
+
         except Exception:
-            log.exception("Scheduler error")
-        await asyncio.sleep(CHECK_INTERVAL)
+            log.exception("Automatic scheduler error")
+
+        await asyncio.sleep(SCHEDULER_INTERVAL)
 
 
 @dp.message(CommandStart())
 async def start_cmd(message: Message) -> None:
     await message.answer(
-        f"🌊 <b>Фонтанка — бот отдыха</b>\n\n"
-        f"Погода, море, волны, прогноз, пляжные советы и предупреждения для {LOCATION_NAME}.\n\n"
-        f"Нажми кнопку ниже 👇",
+        f"🏖 <b>ФОНТАНКА BEACH</b>\n\n"
+        f"Погода, море, волны, прогноз, пляж, факты, фото "
+        f"и предупреждения для {LOCATION_NAME}.\n\n"
+        f"☀️ Я сам публикую сводки в группе утром, днём и вечером.",
         reply_markup=main_keyboard(),
-    )
-
-
-@dp.message(Command("setchat"))
-async def setchat_cmd(message: Message) -> None:
-    if not is_admin(message.from_user.id if message.from_user else None):
-        await message.answer("⛔ Эта команда доступна только администратору, указанному в ADMIN_USER_ID.")
-        return
-    await message.answer(
-        "✅ ID этого чата: <code>" + str(message.chat.id) + "</code>\n\n"
-        "Добавь его в .env как CHAT_ID=... и перезапусти сервис."
     )
 
 
 @dp.message(Command("id"))
 async def id_cmd(message: Message) -> None:
-    await message.answer(f"🆔 Chat ID: <code>{message.chat.id}</code>")
+    await message.answer(
+        f"🆔 Chat ID: <code>{message.chat.id}</code>"
+    )
 
 
 @dp.message(Command("test"))
 async def test_cmd(message: Message) -> None:
-    if not is_admin(message.from_user.id if message.from_user else None):
+    if not is_admin(
+        message.from_user.id if message.from_user else None
+    ):
         return
+
     await send_morning(message.chat.id)
 
 
-@dp.callback_query(F.data.in_({"weather", "sea", "forecast", "beach", "fact", "tip", "alerts", "refresh"}))
+@dp.message(Command("testday"))
+async def testday_cmd(message: Message) -> None:
+    if not is_admin(
+        message.from_user.id if message.from_user else None
+    ):
+        return
+
+    await send_afternoon(message.chat.id)
+
+
+@dp.message(Command("testevening"))
+async def testevening_cmd(message: Message) -> None:
+    if not is_admin(
+        message.from_user.id if message.from_user else None
+    ):
+        return
+
+    await send_evening(message.chat.id)
+
+
+@dp.message(Command("testphoto"))
+async def testphoto_cmd(message: Message) -> None:
+    if not is_admin(
+        message.from_user.id if message.from_user else None
+    ):
+        return
+
+    await send_photo(message.chat.id)
+
+
+@dp.message(Command("testalert"))
+async def testalert_cmd(message: Message) -> None:
+    if not is_admin(
+        message.from_user.id if message.from_user else None
+    ):
+        return
+
+    await message.answer(
+        await air_alert_text(),
+        reply_markup=main_keyboard(),
+    )
+
+
+@dp.callback_query(
+    F.data.in_(
+        {
+            "weather",
+            "sea",
+            "forecast",
+            "beach",
+            "fact",
+            "tip",
+            "alerts",
+            "air_alert",
+            "photo",
+            "refresh",
+        }
+    )
+)
 async def callbacks(query: CallbackQuery) -> None:
     await query.answer()
-    data = await weather.current()
-    if query.data in ("weather", "refresh"):
-        text = weather_text(data)
-    elif query.data == "sea":
-        text = sea_text(data)
-    elif query.data == "forecast":
-        text = forecast_text(await weather.forecast7())
-    elif query.data == "beach":
-        text = f"🏖 <b>Пляж сегодня</b>\n\n{data.beach_rating}\n\n🎯 {random.choice(BEACH_TIPS)}"
-    elif query.data == "fact":
-        text = f"💡 <b>Факт дня</b>\n\n{random.choice(FACTS)}"
-    elif query.data == "tip":
-        text = f"🎯 <b>Совет отдыхающим</b>\n\n{random.choice(BEACH_TIPS)}"
-    else:
-        text = alerts_text(data)
 
-    if query.message:
-        await query.message.edit_text(text, reply_markup=main_keyboard())
+    try:
+        if query.data == "photo":
+            if query.message:
+                await send_photo(query.message.chat.id)
+            return
+
+        if query.data == "air_alert":
+            if query.message:
+                text = await air_alert_text()
+
+                try:
+                    await query.message.edit_text(
+                        text,
+                        reply_markup=main_keyboard(),
+                    )
+                except TelegramBadRequest as exc:
+                    if "message is not modified" not in str(exc).lower():
+                        raise
+
+            return
+
+        data = await get_current()
+
+        if query.data in ("weather", "refresh"):
+            text = weather_text(data)
+
+        elif query.data == "sea":
+            text = sea_text(data)
+
+        elif query.data == "forecast":
+            forecast = await weather.forecast7()
+            text = forecast_text(forecast)
+
+        elif query.data == "beach":
+            text = (
+                f"🏖 <b>ПЛЯЖ СЕГОДНЯ</b>\n\n"
+                f"{data.beach_rating}\n\n"
+                f"🎯 {random.choice(BEACH_TIPS)}"
+            )
+
+        elif query.data == "fact":
+            text = (
+                f"💡 <b>ФАКТ ДНЯ</b>\n\n"
+                f"{random.choice(FACTS)}"
+            )
+
+        elif query.data == "tip":
+            text = (
+                f"🎯 <b>СОВЕТ ОТДЫХАЮЩИМ</b>\n\n"
+                f"{random.choice(BEACH_TIPS)}"
+            )
+
+        else:
+            text = alerts_text(data)
+
+        if query.message:
+            try:
+                await query.message.edit_text(
+                    text,
+                    reply_markup=main_keyboard(),
+                )
+            except TelegramBadRequest as exc:
+                # Повторное нажатие той же кнопки больше не будет
+                # засорять Railway ошибкой.
+                if "message is not modified" not in str(exc).lower():
+                    raise
+
+    except TelegramForbiddenError:
+        log.warning(
+            "Telegram forbids bot from writing to this chat"
+        )
+
+    except Exception:
+        log.exception("Callback error")
 
 
 async def health(_: web.Request) -> web.Response:
@@ -255,26 +680,66 @@ async def health(_: web.Request) -> web.Response:
 
 async def start_health_server() -> web.AppRunner:
     app = web.Application()
+
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PORT,
+    )
     await site.start()
+
     return runner
 
 
 async def main() -> None:
-    global TARGET_CHAT_ID
+    # Если старый webhook где-то остался, удаляем его.
     await bot.delete_webhook(drop_pending_updates=True)
+
     runner = await start_health_server()
-    asyncio.create_task(scheduler_loop())
+
+    # Три независимых фоновых процесса:
+    # 1) автоматические посты
+    # 2) погодные предупреждения
+    # 3) воздушные тревоги
+    asyncio.create_task(automatic_posts_loop())
+    asyncio.create_task(weather_alert_loop())
+    asyncio.create_task(air_alert_loop())
+
     me = await bot.get_me()
-    log.info("Bot started: @%s", me.username)
+
+    log.info(
+        "Bot started: @%s",
+        me.username,
+    )
+
+    log.info(
+        "Automatic posts: %02d:00 / %02d:00 / %02d:00 (%s)",
+        MORNING_HOUR,
+        AFTERNOON_HOUR,
+        EVENING_HOUR,
+        TIMEZONE,
+    )
+
     if TARGET_CHAT_ID is None:
-        log.warning("CHAT_ID is not set. Put the bot in the group and use /id or /setchat.")
+        log.warning(
+            "CHAT_ID is not set. Automatic posts will not be sent "
+            "to a fixed group."
+        )
+    else:
+        log.info(
+            "Automatic posts target chat: %s",
+            TARGET_CHAT_ID,
+        )
+
     try:
         await dp.start_polling(bot)
+
     finally:
         await runner.cleanup()
         await bot.session.close()
